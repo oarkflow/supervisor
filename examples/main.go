@@ -19,6 +19,7 @@ import (
 var envFiles = ".env,databases.json"
 
 func main() {
+	os.Setenv("ENABLE_RESTART", "false")
 	supervisor.Run(Run)
 }
 

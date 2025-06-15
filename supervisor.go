@@ -85,6 +85,7 @@ type Supervisor struct {
 	envPath        string
 	lastEnvHash    string
 	lastOSEnv      map[string]string
+	enableRestart  bool
 }
 
 func Run(callback func(ctx context.Context) error) {
@@ -126,6 +127,12 @@ func Run(callback func(ctx context.Context) error) {
 		crashTimesLock: sync.Mutex{},
 		cmdLock:        sync.Mutex{},
 	}
+	// Initialize enableRestart from environment variable (default true)
+	if val := os.Getenv("ENABLE_RESTART"); val == "false" {
+		s.enableRestart = false
+	} else {
+		s.enableRestart = true
+	}
 	s.computeEnvHash()
 	s.captureOSEnv()
 	s.initWatcher()
@@ -158,6 +165,7 @@ func Run(callback func(ctx context.Context) error) {
 func Execute() {
 	cmdFlag := flag.String("cmd", "", "Command to run as child (e.g. \"go run app.go\")")
 	envFlag := flag.String("env", ".env", "Path to .env file(s) to load/watch, comma‐separated")
+	enableRestartFlag := flag.Bool("enable_restart", true, "Enable supervisor restarts if changes are detected")
 	flag.Parse()
 	if *cmdFlag == "" {
 		fmt.Fprintln(os.Stderr, "Error: --cmd is required")
@@ -184,6 +192,7 @@ func Execute() {
 		crashTimesLock: sync.Mutex{},
 		cmdLock:        sync.Mutex{},
 	}
+	s.enableRestart = *enableRestartFlag
 	s.computeEnvHash()
 	s.captureOSEnv()
 	s.initStandaloneWatcher()
@@ -403,7 +412,7 @@ func (s *Supervisor) watchEnvAndOSEnv() {
 			s.computeEnvHash()
 			if s.lastEnvHash != oldHash {
 				slog.Info("Environment file change detected (hash changed)")
-				s.queueRestart("env_file")
+				// s.queueRestart("env_file")
 			}
 		case <-s.done:
 			return
@@ -412,6 +421,10 @@ func (s *Supervisor) watchEnvAndOSEnv() {
 }
 
 func (s *Supervisor) queueRestart(reason string) {
+	if !s.enableRestart {
+		slog.Info("Restart disabled; ignoring restart event", slog.String("reason", reason))
+		return
+	}
 	select {
 	case <-s.done:
 		return
@@ -641,6 +654,28 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	return len(s.crashTimes) <= crashLoopThreshold
 }
 
+// ManualRestart to manually control the child process.
+func (s *Supervisor) ManualRestart() {
+	// Initiate a manual restart.
+	s.queueRestart("manual")
+}
+
+func (s *Supervisor) ManualShutdown() {
+	// Immediately shutdown the child process.
+	s.killChild()
+}
+
+func (s *Supervisor) ManualStart() error {
+	s.cmdLock.Lock()
+	defer s.cmdLock.Unlock()
+	if s.currentCmd != nil {
+		slog.Info("Child application is already running")
+		return nil
+	}
+	return s.startChild()
+}
+
+// Modify startMetricsServer to add endpoints to manually control the child.
 func (s *Supervisor) startMetricsServer() {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -660,7 +695,38 @@ func (s *Supervisor) startMetricsServer() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	slog.Info("Supervisor: metrics/health listening", slog.String("port", healthPort))
+	// New endpoints for child management:
+	mux.HandleFunc("/child/restart", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.ManualRestart()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("Child restart initiated"))
+	})
+	mux.HandleFunc("/child/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.ManualShutdown()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("Child shutdown initiated"))
+	})
+	mux.HandleFunc("/child/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := s.ManualStart(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("Child started"))
+	})
+	slog.Info("Supervisor: metrics/health and control endpoints listening", slog.String("port", healthPort))
 	server := &http.Server{
 		Addr:    ":" + healthPort,
 		Handler: mux,
