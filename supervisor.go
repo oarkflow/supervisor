@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,12 +23,11 @@ import (
 	"syscall"
 	"time"
 
-	"log/slog"
-
 	"github.com/fsnotify/fsnotify"
 	"github.com/natefinch/lumberjack"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -34,7 +36,6 @@ const (
 	crashLoopThreshold    = 5
 	crashLoopWindow       = 1 * time.Minute
 	healthPort            = "9999"
-	defaultEnvPath        = ".env,databases.json"
 	defaultLogDir         = "./log/myapp"
 	defaultSupervisorLog  = defaultLogDir + "/supervisor.log"
 	defaultChildLog       = defaultLogDir + "/child.log"
@@ -69,6 +70,33 @@ func init() {
 	prometheus.MustRegister(restartCounter, crashCounter, uptimeGauge)
 }
 
+type Config struct {
+	EnvPaths []string `yaml:"envPaths" json:"envPaths"`
+}
+
+// loadConfig reads yaml config from the given path.
+func loadConfig(configPath string) (*Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Contains(configPath, ".yaml") || strings.Contains(configPath, ".yml") {
+		data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")) // Remove UTF-8 BOM if present
+		if err := yaml.Unmarshal(data, &cfg); err == nil {
+			return &cfg, nil
+		}
+	}
+
+	if strings.Contains(configPath, ".json") {
+		data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")) // Remove UTF-8 BOM if present
+		if err := json.Unmarshal(data, &cfg); err == nil {
+			return &cfg, nil
+		}
+	}
+	return nil, fmt.Errorf("failed to load config from %s: unsupported format", configPath)
+}
+
 type Supervisor struct {
 	cmdLock        sync.Mutex
 	currentCmd     *exec.Cmd
@@ -88,7 +116,15 @@ type Supervisor struct {
 	enableRestart  bool
 }
 
-func Run(callback func(ctx context.Context) error) {
+func Run(configPath string, callback func(ctx context.Context) error) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config from %s: %v", configPath, err)
+	}
+	if len(cfg.EnvPaths) == 0 {
+		log.Fatal("no envPaths specified in config.yaml")
+	}
+
 	if os.Getenv("RUN_AS_CHILD") == "1" {
 		setupLogging(defaultSupervisorLog)
 		slog.Info("Child: starting callback")
@@ -116,7 +152,7 @@ func Run(callback func(ctx context.Context) error) {
 		backoff:        defaultRestartBackoff,
 		startTime:      time.Now(),
 		callback:       callback,
-		envPath:        defaultEnvPath,
+		envPath:        strings.Join(cfg.EnvPaths, ","),
 		lastOSEnv:      make(map[string]string),
 		childCommand:   "",
 		crashTimes:     nil,
@@ -164,12 +200,16 @@ func Run(callback func(ctx context.Context) error) {
 
 func Execute() {
 	cmdFlag := flag.String("cmd", "", "Command to run as child (e.g. \"go run app.go\")")
-	envFlag := flag.String("env", ".env", "Path to .env file(s) to load/watch, comma‐separated")
 	enableRestartFlag := flag.Bool("enable_restart", true, "Enable supervisor restarts if changes are detected")
+	configFlag := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 	if *cmdFlag == "" {
 		fmt.Fprintln(os.Stderr, "Error: --cmd is required")
 		os.Exit(1)
+	}
+	cfg, err := loadConfig(*configFlag)
+	if err == nil && len(cfg.EnvPaths) == 0 {
+		log.Fatal("no envPaths specified in config.yaml")
 	}
 	setupLogging(defaultSupervisorLog)
 	checkOrCreatePIDFile(defaultPIDFile)
@@ -181,7 +221,7 @@ func Execute() {
 		backoff:        defaultRestartBackoff,
 		startTime:      time.Now(),
 		callback:       nil,
-		envPath:        *envFlag,
+		envPath:        strings.Join(cfg.EnvPaths, ","),
 		childCommand:   *cmdFlag,
 		lastOSEnv:      make(map[string]string),
 		crashTimes:     nil,
@@ -323,26 +363,50 @@ func (s *Supervisor) initWatcher() {
 		slog.Error("Failed to create fsnotify watcher", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
-	envFiles := strings.Split(s.envPath, ",")
-	for _, file := range envFiles {
-		file = strings.TrimSpace(file)
-		if abs, err := filepath.Abs(file); err == nil {
+	envPaths := strings.Split(s.envPath, ",")
+	for _, p := range envPaths {
+		p = strings.TrimSpace(p)
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			slog.Error("Unable to resolve env path", slog.String("path", p), slog.String("err", err.Error()))
+			os.Exit(1)
+		}
+		fi, err := os.Stat(abs)
+		if err != nil {
+			slog.Error("Cannot stat env path", slog.String("path", abs), slog.String("err", err.Error()))
+			os.Exit(1)
+		}
+		if fi.IsDir() {
+			// Recursively watch the directory and its subdirectories.
+			filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					slog.Error("Error walking path", slog.String("path", path), slog.String("err", err.Error()))
+					return err
+				}
+				if d.IsDir() {
+					if err := s.watcher.Add(path); err != nil {
+						slog.Error("Failed to watch directory", slog.String("dir", path), slog.String("err", err.Error()))
+					} else {
+						slog.Info("Watching directory", slog.String("dir", path))
+					}
+				}
+				return nil
+			})
+		} else {
+			// It's a file; watch its containing directory.
 			dir := filepath.Dir(abs)
 			if err := s.watcher.Add(dir); err != nil {
-				slog.Error("Failed to watch env directory", slog.String("path", dir), slog.String("err", err.Error()))
+				slog.Error("Failed to watch file directory", slog.String("dir", dir), slog.String("err", err.Error()))
 				os.Exit(1)
 			}
-			slog.Info("Watching env file directory", slog.String("dir", dir))
-		} else {
-			slog.Error("Unable to resolve env file", slog.String("file", file), slog.String("err", err.Error()))
-			os.Exit(1)
+			slog.Info("Watching file directory", slog.String("dir", dir))
 		}
 	}
 	if bin, err := os.Executable(); err == nil {
 		if abs, err := filepath.Abs(bin); err == nil {
 			dir := filepath.Dir(abs)
 			if err := s.watcher.Add(dir); err != nil {
-				slog.Error("Failed to watch binary directory", slog.String("dir", dir), slog.String("err", err.Error()))
+				slog.Error("Failed to watch supervisor binary directory", slog.String("dir", dir), slog.String("err", err.Error()))
 				os.Exit(1)
 			}
 			slog.Info("Watching supervisor binary directory", slog.String("dir", dir))
@@ -490,7 +554,9 @@ func (s *Supervisor) startChild() error {
 	env := os.Environ()
 	env = append(env, "RUN_AS_CHILD=1")
 	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	if err := os.MkdirAll(filepath.Dir(defaultChildLog), 0o755); err != nil {
 		slog.Error("Failed to create child log directory", slog.String("err", err.Error()))
 		return err
@@ -565,7 +631,9 @@ func (s *Supervisor) startChildStandalone() error {
 	}
 	cmd := exec.Command("/bin/sh", "-c", s.childCommand)
 	cmd.Env = os.Environ()
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	if err := os.MkdirAll(filepath.Dir(defaultChildLog), 0o755); err != nil {
 		slog.Error("Failed to create child log directory", slog.String("err", err.Error()))
 		return err
@@ -593,13 +661,8 @@ func (s *Supervisor) killChild() {
 	if s.currentCmd == nil || s.currentCmd.Process == nil {
 		return
 	}
-	proc := s.currentCmd.Process
-	pgid, err := syscall.Getpgid(proc.Pid)
-	if err != nil {
-		_ = proc.Signal(syscall.SIGTERM)
-	} else {
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	}
+	pid := s.currentCmd.Process.Pid
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
 		s.currentCmd.Wait()
@@ -610,11 +673,7 @@ func (s *Supervisor) killChild() {
 		slog.Info("Supervisor: child terminated gracefully")
 	case <-time.After(graceTimeout):
 		slog.Warn("Supervisor: child did not exit in time; sending SIGKILL")
-		if pgid >= 0 {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		} else {
-			_ = proc.Kill()
-		}
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		<-done
 	}
 	s.currentCmd = nil
@@ -733,7 +792,7 @@ func (s *Supervisor) startMetricsServer() {
 	}
 	s.httpServer = server
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("Supervisor: metrics server ListenAndServe error", slog.String("err", err.Error()))
 		}
 	}()

@@ -12,15 +12,16 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/joho/godotenv"
-	"github.com/oarkflow/supervisor"
 	"gopkg.in/yaml.v3"
+
+	"github.com/oarkflow/supervisor"
 )
 
-var envFiles = ".env,databases.json"
+var envFiles = ".env"
 
 func main() {
-	os.Setenv("ENABLE_RESTART", "false")
-	supervisor.Run(Run)
+	os.Setenv("ENABLE_RESTART", "true")
+	supervisor.Run("config.json", Run)
 }
 
 func Run(ctx context.Context) error {
