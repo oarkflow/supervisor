@@ -1,0 +1,28 @@
+envPaths:
+  - .env
+  - ./config/app.env
+watchPaths:
+  - .
+  - ./config
+includeGlobs:
+  - "**/*.go"
+  - "**/*.yaml"
+  - "**/*.yml"
+  - "**/*.env"
+ignoreGlobs:
+  - "**/.git/**"
+  - "**/node_modules/**"
+  - "**/*.swp"
+restartOnEnvHashChange: true
+
+healthPort: "9999"
+logDir: "./log/myapp"
+pidFile: "/tmp/supervisor.pid"
+
+restartBackoff: 1s
+maxBackoff: 30s
+crashLoopThreshold: 5
+crashLoopWindow: 1m
+
+enableRestart: true
+controlToken: "change-me"

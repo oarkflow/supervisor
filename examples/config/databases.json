@@ -7,7 +7,7 @@
         "port": 5432,
         "username": "postgres",
         "password": "postgres",
-        "database": "clear_dev1",
+        "database": "clear_dev",
         "ssl_mode": "disable",
         "timezone": "UTC",
         "charset": "utf8mb4",

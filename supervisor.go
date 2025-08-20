@@ -12,11 +12,13 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -33,15 +35,16 @@ import (
 const (
 	debounceDelay         = 500 * time.Millisecond
 	graceTimeout          = 5 * time.Second
-	crashLoopThreshold    = 5
-	crashLoopWindow       = 1 * time.Minute
-	healthPort            = "9999"
+	defaultCrashThreshold = 5
+	defaultCrashWindow    = 1 * time.Minute
+	defaultHealthPort     = "9999"
 	defaultLogDir         = "./log/myapp"
 	defaultSupervisorLog  = defaultLogDir + "/supervisor.log"
 	defaultChildLog       = defaultLogDir + "/child.log"
 	defaultPIDFile        = "/tmp/supervisor.pid"
 	defaultRestartBackoff = 1 * time.Second
 	defaultMaxBackoff     = 30 * time.Second
+	jitterFraction        = 0.2 // +/- 20%
 )
 
 var (
@@ -64,37 +67,69 @@ var (
 			Help: "Supervisor uptime in seconds.",
 		},
 	)
+	childRunningGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "supervisor_child_running",
+			Help: "1 if a child process is running, 0 otherwise.",
+		},
+	)
+	backoffGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "supervisor_restart_backoff_seconds",
+			Help: "Current restart backoff duration in seconds.",
+		},
+	)
 )
 
 func init() {
-	prometheus.MustRegister(restartCounter, crashCounter, uptimeGauge)
+	prometheus.MustRegister(restartCounter, crashCounter, uptimeGauge, childRunningGauge, backoffGauge)
+	rand.Seed(time.Now().UnixNano())
 }
 
 type Config struct {
-	EnvPaths []string `yaml:"envPaths" json:"envPaths"`
+	EnvPaths               []string      `yaml:"envPaths" json:"envPaths"`
+	WatchPaths             []string      `yaml:"watchPaths" json:"watchPaths"`
+	IncludeGlobs           []string      `yaml:"includeGlobs" json:"includeGlobs"`
+	IgnoreGlobs            []string      `yaml:"ignoreGlobs" json:"ignoreGlobs"`
+	RestartOnEnvHashChange bool          `yaml:"restartOnEnvHashChange" json:"restartOnEnvHashChange"`
+	EnableRestart          *bool         `yaml:"enableRestart" json:"enableRestart"`
+	HealthPort             string        `yaml:"healthPort" json:"healthPort"`
+	LogDir                 string        `yaml:"logDir" json:"logDir"`
+	PIDFile                string        `yaml:"pidFile" json:"pidFile"`
+	RestartBackoff         time.Duration `yaml:"restartBackoff" json:"restartBackoff"`
+	MaxBackoff             time.Duration `yaml:"maxBackoff" json:"maxBackoff"`
+	CrashLoopThreshold     int           `yaml:"crashLoopThreshold" json:"crashLoopThreshold"`
+	CrashLoopWindow        time.Duration `yaml:"crashLoopWindow" json:"crashLoopWindow"`
+	ControlToken           string        `yaml:"controlToken" json:"controlToken"`
 }
 
-// loadConfig reads yaml config from the given path.
+// loadConfig: supports YAML or JSON; returns empty config (not nil) if not found.
 func loadConfig(configPath string) (*Config, error) {
-	var cfg Config
+	if configPath == "" {
+		return &Config{}, nil
+	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, err
+		// Not fatal; return empty config to keep standalone flexible
+		return &Config{}, nil
 	}
-	if strings.Contains(configPath, ".yaml") || strings.Contains(configPath, ".yml") {
-		data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")) // Remove UTF-8 BOM if present
-		if err := yaml.Unmarshal(data, &cfg); err == nil {
-			return &cfg, nil
+	cfg := &Config{}
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	var umErr error
+	if strings.HasSuffix(configPath, ".yaml") || strings.HasSuffix(configPath, ".yml") {
+		umErr = yaml.Unmarshal(data, cfg)
+	} else if strings.HasSuffix(configPath, ".json") {
+		umErr = json.Unmarshal(data, cfg)
+	} else {
+		// best effort: try yaml then json
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			umErr = json.Unmarshal(data, cfg)
 		}
 	}
-
-	if strings.Contains(configPath, ".json") {
-		data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")) // Remove UTF-8 BOM if present
-		if err := json.Unmarshal(data, &cfg); err == nil {
-			return &cfg, nil
-		}
+	if umErr != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", umErr)
 	}
-	return nil, fmt.Errorf("failed to load config from %s: unsupported format", configPath)
+	return cfg, nil
 }
 
 type Supervisor struct {
@@ -110,23 +145,157 @@ type Supervisor struct {
 	httpServer     *http.Server
 	callback       func(ctx context.Context) error
 	childCommand   string
-	envPath        string
-	lastEnvHash    string
-	lastOSEnv      map[string]string
-	enableRestart  bool
+
+	// config-derived
+	envPaths     []string
+	watchPaths   []string
+	includeGlobs []string
+	ignoreGlobs  []string
+
+	lastEnvHash   string
+	lastOSEnv     map[string]string
+	enableRestart bool
+
+	healthPort    string
+	logDir        string
+	supervisorLog string
+	childLog      string
+	pidFile       string
+
+	minBackoff  time.Duration
+	maxBackoff  time.Duration
+	crashThresh int
+	crashWindow time.Duration
+
+	controlToken           string
+	restartOnEnvHashChange bool
+
+	// status
+	lastRestartReason string
+	lastRestartAt     time.Time
 }
+
+// ---------- Public entrypoints ----------
 
 func Run(configPath string, callback func(ctx context.Context) error) {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config from %s: %v", configPath, err)
 	}
-	if len(cfg.EnvPaths) == 0 {
-		log.Fatal("no envPaths specified in config.yaml")
+	s := newSupervisor(cfg, callback, "")
+	s.bootstrap()
+	s.mainLoop()
+}
+
+func Execute() {
+	cmdFlag := flag.String("cmd", "", "Command to run as child (e.g. \"go run app.go\")")
+	enableRestartFlag := flag.Bool("enable_restart", true, "Enable supervisor restarts if changes are detected")
+	configFlag := flag.String("config", "config.yaml", "Path to YAML/JSON configuration file")
+	flag.Parse()
+
+	if *cmdFlag == "" {
+		fmt.Fprintln(os.Stderr, "Error: --cmd is required")
+		os.Exit(1)
+	}
+	cfg, err := loadConfig(*configFlag)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	s := newSupervisor(cfg, nil, *cmdFlag)
+	// CLI flag overrides config
+	if enableRestartFlag != nil {
+		s.enableRestart = *enableRestartFlag
+	}
+	s.bootstrap()
+	s.mainLoop()
+}
+
+// ---------- Construction / defaults ----------
+
+func newSupervisor(cfg *Config, cb func(ctx context.Context) error, childCmd string) *Supervisor {
+	// defaults
+	enableRestart := true
+	if cfg.EnableRestart != nil {
+		enableRestart = *cfg.EnableRestart
+	} else if v := os.Getenv("ENABLE_RESTART"); v == "false" {
+		enableRestart = false
+	}
+	healthPort := cfg.HealthPort
+	if healthPort == "" {
+		healthPort = defaultHealthPort
+	}
+	logDir := cfg.LogDir
+	if logDir == "" {
+		logDir = defaultLogDir
+	}
+	pidFile := cfg.PIDFile
+	if pidFile == "" {
+		pidFile = defaultPIDFile
+	}
+	minBackoff := cfg.RestartBackoff
+	if minBackoff == 0 {
+		minBackoff = defaultRestartBackoff
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff == 0 {
+		maxBackoff = defaultMaxBackoff
+	}
+	crashThresh := cfg.CrashLoopThreshold
+	if crashThresh == 0 {
+		crashThresh = defaultCrashThreshold
+	}
+	crashWindow := cfg.CrashLoopWindow
+	if crashWindow == 0 {
+		crashWindow = defaultCrashWindow
 	}
 
+	// sane ignore defaults
+	ignore := cfg.IgnoreGlobs
+	if len(ignore) == 0 {
+		ignore = []string{
+			"**/.git/**",
+			"**/.idea/**",
+			"**/.vscode/**",
+			"**/*.swp",
+			"**/*.tmp",
+			"**/*.log",
+			"**/node_modules/**",
+			"**/dist/**",
+			"**/build/**",
+		}
+	}
+
+	return &Supervisor{
+		restartEvent:           make(chan string, 1),
+		done:                   make(chan struct{}),
+		backoff:                minBackoff,
+		startTime:              time.Now(),
+		callback:               cb,
+		childCommand:           childCmd,
+		envPaths:               dedupStrings(cfg.EnvPaths),
+		watchPaths:             dedupStrings(append(cfg.WatchPaths, cfg.EnvPaths...)),
+		includeGlobs:           dedupStrings(cfg.IncludeGlobs),
+		ignoreGlobs:            dedupStrings(ignore),
+		lastOSEnv:              make(map[string]string),
+		healthPort:             healthPort,
+		logDir:                 logDir,
+		supervisorLog:          filepath.Join(logDir, "supervisor.log"),
+		childLog:               filepath.Join(logDir, "child.log"),
+		pidFile:                pidFile,
+		minBackoff:             minBackoff,
+		maxBackoff:             maxBackoff,
+		crashThresh:            crashThresh,
+		crashWindow:            crashWindow,
+		enableRestart:          enableRestart,
+		controlToken:           firstNonEmpty(cfg.ControlToken, os.Getenv("SUPERVISOR_TOKEN")),
+		restartOnEnvHashChange: cfg.RestartOnEnvHashChange,
+	}
+}
+
+func (s *Supervisor) bootstrap() {
 	if os.Getenv("RUN_AS_CHILD") == "1" {
-		setupLogging(defaultSupervisorLog)
+		// Child mode: log to child log
+		setupLogging(s.childLog)
 		slog.Info("Child: starting callback")
 		ctx, cancel := context.WithCancel(context.Background())
 		sigC := make(chan os.Signal, 1)
@@ -136,131 +305,43 @@ func Run(configPath string, callback func(ctx context.Context) error) {
 			slog.Info("Child: shutdown signal received, cancelling context")
 			cancel()
 		}()
-		if err := callback(ctx); err != nil {
+		if s.callback == nil {
+			slog.Error("Child: callback is nil in library mode")
+			os.Exit(1)
+		}
+		if err := s.callback(ctx); err != nil {
 			slog.Error("Child: callback returned error", slog.String("err", err.Error()))
 			os.Exit(1)
 		}
 		return
 	}
-	setupLogging(defaultSupervisorLog)
-	checkOrCreatePIDFile(defaultPIDFile)
-	defer removePIDFile(defaultPIDFile)
-	slog.Info("Supervisor: starting (library mode)")
-	s := &Supervisor{
-		restartEvent:   make(chan string, 1),
-		done:           make(chan struct{}),
-		backoff:        defaultRestartBackoff,
-		startTime:      time.Now(),
-		callback:       callback,
-		envPath:        strings.Join(cfg.EnvPaths, ","),
-		lastOSEnv:      make(map[string]string),
-		childCommand:   "",
-		crashTimes:     nil,
-		currentCmd:     nil,
-		httpServer:     nil,
-		watcher:        nil,
-		lastEnvHash:    "",
-		crashTimesLock: sync.Mutex{},
-		cmdLock:        sync.Mutex{},
-	}
-	// Initialize enableRestart from environment variable (default true)
-	if val := os.Getenv("ENABLE_RESTART"); val == "false" {
-		s.enableRestart = false
-	} else {
-		s.enableRestart = true
-	}
+
+	setupLogging(s.supervisorLog)
+	s.handlePIDFile() // robust handling for stale PID files
+
+	slog.Info("Supervisor: starting",
+		slog.String("mode", ifThenElse(s.callback != nil, "library", "standalone")),
+		slog.String("healthPort", s.healthPort),
+	)
+
 	s.computeEnvHash()
 	s.captureOSEnv()
+
 	s.initWatcher()
-	defer s.watcher.Close()
-	go s.watchFiles()
-	go s.watchEnvAndOSEnv()
-	go s.spawnAndMonitor()
-	go s.startMetricsServer()
-	sigC := make(chan os.Signal, 1)
-	signal.Notify(sigC, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
-	for {
-		select {
-		case sig := <-sigC:
-			switch sig {
-			case syscall.SIGHUP:
-				slog.Info("Supervisor: SIGHUP received, scheduling reload")
-				s.queueRestart("sighup")
-			default:
-				slog.Info("Supervisor: shutdown signal received, tearing down child and exiting")
-				close(s.done)
-				s.killChild()
-				return
-			}
-		case <-s.done:
-			return
-		}
+	go s.watchLoop()
+
+	go s.envPoller()
+	go s.metricsServer()
+
+	// choose spawn loop
+	if s.callback != nil {
+		go s.spawnAndMonitor()
+	} else {
+		go s.spawnAndMonitorStandalone()
 	}
 }
 
-func Execute() {
-	cmdFlag := flag.String("cmd", "", "Command to run as child (e.g. \"go run app.go\")")
-	enableRestartFlag := flag.Bool("enable_restart", true, "Enable supervisor restarts if changes are detected")
-	configFlag := flag.String("config", "config.yaml", "Path to YAML configuration file")
-	flag.Parse()
-	if *cmdFlag == "" {
-		fmt.Fprintln(os.Stderr, "Error: --cmd is required")
-		os.Exit(1)
-	}
-	cfg, err := loadConfig(*configFlag)
-	if err == nil && len(cfg.EnvPaths) == 0 {
-		log.Fatal("no envPaths specified in config.yaml")
-	}
-	setupLogging(defaultSupervisorLog)
-	checkOrCreatePIDFile(defaultPIDFile)
-	defer removePIDFile(defaultPIDFile)
-	slog.Info("Supervisor: starting (standalone mode)")
-	s := &Supervisor{
-		restartEvent:   make(chan string, 1),
-		done:           make(chan struct{}),
-		backoff:        defaultRestartBackoff,
-		startTime:      time.Now(),
-		callback:       nil,
-		envPath:        strings.Join(cfg.EnvPaths, ","),
-		childCommand:   *cmdFlag,
-		lastOSEnv:      make(map[string]string),
-		crashTimes:     nil,
-		currentCmd:     nil,
-		httpServer:     nil,
-		watcher:        nil,
-		lastEnvHash:    "",
-		crashTimesLock: sync.Mutex{},
-		cmdLock:        sync.Mutex{},
-	}
-	s.enableRestart = *enableRestartFlag
-	s.computeEnvHash()
-	s.captureOSEnv()
-	s.initStandaloneWatcher()
-	defer s.watcher.Close()
-	go s.watchFiles()
-	go s.watchEnvAndOSEnv()
-	go s.spawnAndMonitorStandalone()
-	go s.startMetricsServer()
-	sigC := make(chan os.Signal, 1)
-	signal.Notify(sigC, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
-	for {
-		select {
-		case sig := <-sigC:
-			switch sig {
-			case syscall.SIGHUP:
-				slog.Info("Supervisor: SIGHUP received, scheduling reload")
-				s.queueRestart("sighup")
-			default:
-				slog.Info("Supervisor: shutdown signal received, tearing down child and exiting")
-				close(s.done)
-				s.killChild()
-				return
-			}
-		case <-s.done:
-			return
-		}
-	}
-}
+// ---------- Logging / PID ----------
 
 func setupLogging(logPath string) {
 	dir := filepath.Dir(logPath)
@@ -280,31 +361,51 @@ func setupLogging(logPath string) {
 	slog.SetDefault(slog.New(handler))
 }
 
-func checkOrCreatePIDFile(pidFile string) {
-	if _, err := os.Stat(pidFile); err == nil {
-		slog.Error("PID file already exists; another instance may be running", slog.String("file", pidFile))
-		os.Exit(1)
+func (s *Supervisor) handlePIDFile() {
+	// If existing, check liveness; otherwise create
+	if b, err := os.ReadFile(s.pidFile); err == nil {
+		var oldPID int
+		_, _ = fmt.Sscanf(string(b), "%d", &oldPID)
+		if oldPID > 0 && processAlive(oldPID) {
+			slog.Error("PID file exists and process appears alive. Another instance may be running.",
+				slog.String("file", s.pidFile), slog.Int("pid", oldPID))
+			os.Exit(1)
+		}
+		slog.Warn("Stale PID file found; overwriting", slog.String("file", s.pidFile), slog.Int("pid", oldPID))
 	}
 	pid := os.Getpid()
-	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0o644); err != nil {
+	if err := os.WriteFile(s.pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0o644); err != nil {
 		slog.Error("Failed to write PID file", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
+	// ensure removal on exit
+	go func() {
+		<-s.done
+		_ = os.Remove(s.pidFile)
+	}()
 }
 
-func removePIDFile(pidFile string) {
-	_ = os.Remove(pidFile)
+func processAlive(pid int) bool {
+	// On Unix, signal 0 checks liveness
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil
 }
+
+// ---------- Env / hashing ----------
 
 func (s *Supervisor) computeEnvHash() {
-	files := strings.Split(s.envPath, ",")
+	files := dedupStrings(s.envPaths)
 	sort.Strings(files)
 	var buf bytes.Buffer
 	for _, file := range files {
 		file = strings.TrimSpace(file)
 		data, err := os.ReadFile(file)
 		if err != nil {
-
+			// don't spam logs; just note once
+			slog.Debug("Env file not readable", slog.String("file", file), slog.String("err", err.Error()))
 			continue
 		}
 		buf.WriteString("file:" + file + "\n")
@@ -335,12 +436,12 @@ func (s *Supervisor) detectOSEnvChanges() bool {
 			curr[parts[0]] = parts[1]
 		}
 	}
-	for k, v := range curr {
-		if old, ok := s.lastOSEnv[k]; !ok {
-			slog.Info("OS env added", slog.String("key", k), slog.String("val", v))
+	for k := range curr {
+		if _, ok := s.lastOSEnv[k]; !ok {
+			slog.Info("OS env added", slog.String("key", k))
 			changed = true
-		} else if old != v {
-			slog.Info("OS env changed", slog.String("key", k), slog.String("from", old), slog.String("to", v))
+		} else if s.lastOSEnv[k] != curr[k] {
+			slog.Info("OS env changed", slog.String("key", k))
 			changed = true
 		}
 	}
@@ -356,6 +457,8 @@ func (s *Supervisor) detectOSEnvChanges() bool {
 	return changed
 }
 
+// ---------- Watchers ----------
+
 func (s *Supervisor) initWatcher() {
 	var err error
 	s.watcher, err = fsnotify.NewWatcher()
@@ -363,107 +466,176 @@ func (s *Supervisor) initWatcher() {
 		slog.Error("Failed to create fsnotify watcher", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
-	envPaths := strings.Split(s.envPath, ",")
-	for _, p := range envPaths {
+	paths := s.watchPaths
+	if len(paths) == 0 {
+		// fall back to supervisor binary dir
+		if bin, err := os.Executable(); err == nil {
+			if abs, err := filepath.Abs(bin); err == nil {
+				paths = []string{filepath.Dir(abs)}
+			}
+		}
+	}
+	for _, p := range paths {
 		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
 		abs, err := filepath.Abs(p)
 		if err != nil {
-			slog.Error("Unable to resolve env path", slog.String("path", p), slog.String("err", err.Error()))
-			os.Exit(1)
+			slog.Error("Unable to resolve watch path", slog.String("path", p), slog.String("err", err.Error()))
+			continue
 		}
 		fi, err := os.Stat(abs)
 		if err != nil {
-			slog.Error("Cannot stat env path", slog.String("path", abs), slog.String("err", err.Error()))
-			os.Exit(1)
+			slog.Error("Cannot stat watch path", slog.String("path", abs), slog.String("err", err.Error()))
+			continue
 		}
 		if fi.IsDir() {
-			// Recursively watch the directory and its subdirectories.
 			filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
 				if err != nil {
-					slog.Error("Error walking path", slog.String("path", path), slog.String("err", err.Error()))
-					return err
+					return nil
 				}
 				if d.IsDir() {
-					if err := s.watcher.Add(path); err != nil {
-						slog.Error("Failed to watch directory", slog.String("dir", path), slog.String("err", err.Error()))
-					} else {
-						slog.Info("Watching directory", slog.String("dir", path))
-					}
+					_ = s.watcher.Add(path)
 				}
 				return nil
 			})
 		} else {
-			// It's a file; watch its containing directory.
-			dir := filepath.Dir(abs)
-			if err := s.watcher.Add(dir); err != nil {
-				slog.Error("Failed to watch file directory", slog.String("dir", dir), slog.String("err", err.Error()))
-				os.Exit(1)
-			}
-			slog.Info("Watching file directory", slog.String("dir", dir))
+			_ = s.watcher.Add(filepath.Dir(abs))
 		}
 	}
+
+	// watch supervisor binary dir as a fallback
 	if bin, err := os.Executable(); err == nil {
 		if abs, err := filepath.Abs(bin); err == nil {
-			dir := filepath.Dir(abs)
-			if err := s.watcher.Add(dir); err != nil {
-				slog.Error("Failed to watch supervisor binary directory", slog.String("dir", dir), slog.String("err", err.Error()))
-				os.Exit(1)
-			}
-			slog.Info("Watching supervisor binary directory", slog.String("dir", dir))
+			_ = s.watcher.Add(filepath.Dir(abs))
 		}
 	}
+
+	// watch AWS config dirs softly
 	if home := os.Getenv("HOME"); home != "" {
-		awsConfig := filepath.Join(home, ".aws", "config")
-		awsCreds := filepath.Join(home, ".aws", "credentials")
-		for _, f := range []string{awsConfig, awsCreds} {
+		for _, f := range []string{filepath.Join(home, ".aws", "config"), filepath.Join(home, ".aws", "credentials")} {
 			if abs, err := filepath.Abs(f); err == nil {
-				dir := filepath.Dir(abs)
-				if err := s.watcher.Add(dir); err == nil {
-					slog.Info("Watching AWS config/credentials directory", slog.String("dir", dir))
-				}
+				_ = s.watcher.Add(filepath.Dir(abs))
 			}
 		}
 	}
 }
 
-func (s *Supervisor) initStandaloneWatcher() {
-	s.initWatcher()
+func (s *Supervisor) matchGlobs(name string, globs []string) bool {
+	if len(globs) == 0 {
+		return true // no filters
+	}
+	// minimal globber — use filepath.Match per segment
+	name = filepath.ToSlash(name)
+	for _, g := range globs {
+		g = filepath.ToSlash(g)
+		ok, _ := filepath.Match(g, name)
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
-func (s *Supervisor) watchFiles() {
-	timer := time.NewTimer(0)
-	<-timer.C
-	var mu sync.Mutex
-	debounce := func(reason string) {
-		select {
-		case <-s.done:
-			return
-		default:
+func (s *Supervisor) ignored(name string) bool {
+	// ignore if matches any ignore glob
+	name = filepath.ToSlash(name)
+	for _, g := range s.ignoreGlobs {
+		ok, _ := filepath.Match(g, name)
+		if ok {
+			return true
 		}
-		mu.Lock()
-		defer mu.Unlock()
-		timer.Reset(debounceDelay)
-		go func() {
-			<-timer.C
-			s.queueRestart(reason)
-		}()
 	}
+	return false
+}
+
+func (s *Supervisor) watchLoop() {
+	// safe debounce: queue latest reason, fire once after calm period
+	type dEvent struct{ reason string }
+	debounceC := make(chan dEvent, 1)
+
+	go func() {
+		var last dEvent
+		var timer *time.Timer
+		for {
+			select {
+			case ev := <-debounceC:
+				last = ev
+				if timer == nil {
+					timer = time.NewTimer(debounceDelay)
+				} else {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(debounceDelay)
+				}
+			case <-func() <-chan time.Time {
+				if timer != nil {
+					return timer.C
+				}
+				// dormant channel
+				ch := make(chan time.Time)
+				return ch
+			}():
+				s.queueRestart(last.reason)
+			case <-s.done:
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case event := <-s.watcher.Events:
-			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
-				slog.Info("File event detected", slog.String("file", event.Name), slog.String("op", event.Op.String()))
-				debounce(event.Name)
+			op := event.Op
+			name := event.Name
+
+			if s.ignored(name) {
+				continue
+			}
+			// include filter (if provided)
+			if len(s.includeGlobs) > 0 && !s.matchGlobs(name, s.includeGlobs) {
+				continue
+			}
+
+			// If a new directory is created, add it to watcher
+			if op&fsnotify.Create != 0 {
+				if fi, err := os.Stat(name); err == nil && fi.IsDir() {
+					filepath.WalkDir(name, func(path string, d os.DirEntry, err error) error {
+						if err == nil && d.IsDir() && !s.ignored(path) {
+							_ = s.watcher.Add(path)
+						}
+						return nil
+					})
+				}
+			}
+
+			if op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+				slog.Info("File event", slog.String("file", name), slog.String("op", op.String()))
+				select {
+				case debounceC <- dEvent{reason: name}:
+				default:
+					// drop if busy; latest will still be processed
+				}
 			}
 		case err := <-s.watcher.Errors:
-			slog.Error("Watcher error", slog.String("err", err.Error()))
+			if err != nil {
+				slog.Error("Watcher error", slog.String("err", err.Error()))
+			}
 		case <-s.done:
+			_ = s.watcher.Close()
 			return
 		}
 	}
 }
 
-func (s *Supervisor) watchEnvAndOSEnv() {
+// ---------- Env polling ----------
+
+func (s *Supervisor) envPoller() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -472,17 +644,21 @@ func (s *Supervisor) watchEnvAndOSEnv() {
 			if s.detectOSEnvChanges() {
 				s.queueRestart("os_env")
 			}
-			oldHash := s.lastEnvHash
+			old := s.lastEnvHash
 			s.computeEnvHash()
-			if s.lastEnvHash != oldHash {
-				slog.Info("Environment file change detected (hash changed)")
-				// s.queueRestart("env_file")
+			if s.lastEnvHash != old {
+				slog.Info("Environment file hash changed")
+				if s.restartOnEnvHashChange {
+					s.queueRestart("env_file")
+				}
 			}
 		case <-s.done:
 			return
 		}
 	}
 }
+
+// ---------- Restart queue ----------
 
 func (s *Supervisor) queueRestart(reason string) {
 	if !s.enableRestart {
@@ -494,8 +670,13 @@ func (s *Supervisor) queueRestart(reason string) {
 		return
 	case s.restartEvent <- reason:
 	default:
+		// Already queued; keep last reason for status
 	}
+	s.lastRestartReason = reason
+	s.lastRestartAt = time.Now()
 }
+
+// ---------- Spawn/monitor (library) ----------
 
 func (s *Supervisor) spawnAndMonitor() {
 	for {
@@ -505,14 +686,14 @@ func (s *Supervisor) spawnAndMonitor() {
 		default:
 		}
 		s.resetBackoff()
-		if err := s.startChild(); err != nil {
-			slog.Error("Failed to start child process", slog.String("err", err.Error()))
+
+		if err := s.startChildLibrary(); err != nil {
+			slog.Error("Failed to start child (library mode)", slog.String("err", err.Error()))
 			os.Exit(1)
 		}
 		exitCh := make(chan error, 1)
-		go func() {
-			exitCh <- s.currentCmd.Wait()
-		}()
+		go func() { exitCh <- s.currentCmd.Wait() }()
+
 		select {
 		case reason := <-s.restartEvent:
 			slog.Info("Supervisor: restarting child", slog.String("reason", reason))
@@ -525,7 +706,8 @@ func (s *Supervisor) spawnAndMonitor() {
 				crashCounter.Inc()
 				if !s.recordCrashAndCheckLoop() {
 					slog.Error("Too many child crashes in short window; supervisor exiting")
-					os.Exit(1)
+					close(s.done)
+					return
 				}
 			} else {
 				slog.Info("Child exited cleanly")
@@ -534,7 +716,6 @@ func (s *Supervisor) spawnAndMonitor() {
 				continue
 			}
 			return
-
 		case <-s.done:
 			s.killChild()
 			return
@@ -542,27 +723,26 @@ func (s *Supervisor) spawnAndMonitor() {
 	}
 }
 
-func (s *Supervisor) startChild() error {
+func (s *Supervisor) startChildLibrary() error {
 	s.cmdLock.Lock()
 	defer s.cmdLock.Unlock()
+
 	binPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("unable to get executable path: %w", err)
 	}
 	args := os.Args[1:]
 	cmd := exec.Command(binPath, args...)
-	env := os.Environ()
-	env = append(env, "RUN_AS_CHILD=1")
-	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+	cmd.Env = append(os.Environ(), "RUN_AS_CHILD=1")
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
-	if err := os.MkdirAll(filepath.Dir(defaultChildLog), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.childLog), 0o755); err != nil {
 		slog.Error("Failed to create child log directory", slog.String("err", err.Error()))
 		return err
 	}
 	childLogger := &lumberjack.Logger{
-		Filename:   defaultChildLog,
+		Filename:   s.childLog,
 		MaxSize:    10,
 		MaxBackups: 5,
 		MaxAge:     28,
@@ -570,13 +750,17 @@ func (s *Supervisor) startChild() error {
 	}
 	cmd.Stdout = io.MultiWriter(os.Stdout, childLogger)
 	cmd.Stderr = io.MultiWriter(os.Stderr, childLogger)
+
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	s.currentCmd = cmd
+	childRunningGauge.Set(1)
 	slog.Info("Supervisor: spawned child process", slog.Int("pid", cmd.Process.Pid))
 	return nil
 }
+
+// ---------- Spawn/monitor (standalone) ----------
 
 func (s *Supervisor) spawnAndMonitorStandalone() {
 	for {
@@ -586,14 +770,14 @@ func (s *Supervisor) spawnAndMonitorStandalone() {
 		default:
 		}
 		s.resetBackoff()
+
 		if err := s.startChildStandalone(); err != nil {
 			slog.Error("Failed to start child process", slog.String("err", err.Error()))
 			os.Exit(1)
 		}
 		exitCh := make(chan error, 1)
-		go func() {
-			exitCh <- s.currentCmd.Wait()
-		}()
+		go func() { exitCh <- s.currentCmd.Wait() }()
+
 		select {
 		case reason := <-s.restartEvent:
 			slog.Info("Supervisor: restarting child", slog.String("reason", reason))
@@ -606,7 +790,8 @@ func (s *Supervisor) spawnAndMonitorStandalone() {
 				crashCounter.Inc()
 				if !s.recordCrashAndCheckLoop() {
 					slog.Error("Too many child crashes in short window; supervisor exiting")
-					os.Exit(1)
+					close(s.done)
+					return
 				}
 			} else {
 				slog.Info("Child exited cleanly")
@@ -615,7 +800,6 @@ func (s *Supervisor) spawnAndMonitorStandalone() {
 				continue
 			}
 			return
-
 		case <-s.done:
 			s.killChild()
 			return
@@ -631,15 +815,15 @@ func (s *Supervisor) startChildStandalone() error {
 	}
 	cmd := exec.Command("/bin/sh", "-c", s.childCommand)
 	cmd.Env = os.Environ()
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
-	if err := os.MkdirAll(filepath.Dir(defaultChildLog), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.childLog), 0o755); err != nil {
 		slog.Error("Failed to create child log directory", slog.String("err", err.Error()))
 		return err
 	}
 	childLogger := &lumberjack.Logger{
-		Filename:   defaultChildLog,
+		Filename:   s.childLog,
 		MaxSize:    10,
 		MaxBackups: 5,
 		MaxAge:     28,
@@ -647,13 +831,17 @@ func (s *Supervisor) startChildStandalone() error {
 	}
 	cmd.Stdout = io.MultiWriter(os.Stdout, childLogger)
 	cmd.Stderr = io.MultiWriter(os.Stderr, childLogger)
+
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	s.currentCmd = cmd
+	childRunningGauge.Set(1)
 	slog.Info("Supervisor: spawned standalone child", slog.Int("pid", cmd.Process.Pid), slog.String("cmd", s.childCommand))
 	return nil
 }
+
+// ---------- Control ----------
 
 func (s *Supervisor) killChild() {
 	s.cmdLock.Lock()
@@ -662,32 +850,50 @@ func (s *Supervisor) killChild() {
 		return
 	}
 	pid := s.currentCmd.Process.Pid
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
+
+	// Graceful first
+	if runtime.GOOS != "windows" {
+		_ = syscall.Kill(-pid, syscall.SIGTERM) // process group
+	} else {
+		_ = s.currentCmd.Process.Signal(os.Interrupt)
+	}
+
 	done := make(chan struct{})
 	go func() {
-		s.currentCmd.Wait()
+		_, _ = s.currentCmd.Process.Wait()
 		close(done)
 	}()
+
 	select {
 	case <-done:
 		slog.Info("Supervisor: child terminated gracefully")
 	case <-time.After(graceTimeout):
 		slog.Warn("Supervisor: child did not exit in time; sending SIGKILL")
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		if runtime.GOOS != "windows" {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		} else {
+			_ = s.currentCmd.Process.Kill()
+		}
 		<-done
 	}
 	s.currentCmd = nil
+	childRunningGauge.Set(0)
 }
 
 func (s *Supervisor) resetBackoff() {
-	s.backoff = defaultRestartBackoff
+	s.backoff = s.minBackoff
+	backoffGauge.Set(s.backoff.Seconds())
 }
 
 func (s *Supervisor) backoffAndSleep() bool {
-	d := s.backoff
-	if s.backoff < defaultMaxBackoff {
+	d := s.withJitter(s.backoff)
+	if s.backoff < s.maxBackoff {
 		s.backoff *= 2
+		if s.backoff > s.maxBackoff {
+			s.backoff = s.maxBackoff
+		}
 	}
+	backoffGauge.Set(d.Seconds())
 	slog.Info("Supervisor: backing off before restart", slog.Duration("duration", d))
 	select {
 	case <-time.After(d):
@@ -697,11 +903,20 @@ func (s *Supervisor) backoffAndSleep() bool {
 	}
 }
 
+func (s *Supervisor) withJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	// +/- jitterFraction
+	f := 1 + (rand.Float64()*2-1)*jitterFraction
+	return time.Duration(float64(d) * f)
+}
+
 func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	s.crashTimesLock.Lock()
 	defer s.crashTimesLock.Unlock()
 	now := time.Now()
-	windowStart := now.Add(-crashLoopWindow)
+	windowStart := now.Add(-s.crashWindow)
 	newList := s.crashTimes[:0]
 	for _, t := range s.crashTimes {
 		if t.After(windowStart) {
@@ -710,19 +925,12 @@ func (s *Supervisor) recordCrashAndCheckLoop() bool {
 	}
 	s.crashTimes = newList
 	s.crashTimes = append(s.crashTimes, now)
-	return len(s.crashTimes) <= crashLoopThreshold
+	return len(s.crashTimes) <= s.crashThresh
 }
 
-// ManualRestart to manually control the child process.
-func (s *Supervisor) ManualRestart() {
-	// Initiate a manual restart.
-	s.queueRestart("manual")
-}
-
-func (s *Supervisor) ManualShutdown() {
-	// Immediately shutdown the child process.
-	s.killChild()
-}
+// Manual controls
+func (s *Supervisor) ManualRestart()  { s.queueRestart("manual") }
+func (s *Supervisor) ManualShutdown() { s.killChild() }
 
 func (s *Supervisor) ManualStart() error {
 	s.cmdLock.Lock()
@@ -731,11 +939,17 @@ func (s *Supervisor) ManualStart() error {
 		slog.Info("Child application is already running")
 		return nil
 	}
-	return s.startChild()
+	// choose appropriate starter
+	if s.callback != nil {
+		return s.startChildLibrary()
+	}
+	return s.startChildStandalone()
 }
 
-// Modify startMetricsServer to add endpoints to manually control the child.
-func (s *Supervisor) startMetricsServer() {
+// ---------- Metrics / HTTP ----------
+
+func (s *Supervisor) metricsServer() {
+	// uptime ticker
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -748,14 +962,60 @@ func (s *Supervisor) startMetricsServer() {
 			}
 		}
 	}()
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	// New endpoints for child management:
-	mux.HandleFunc("/child/restart", func(w http.ResponseWriter, r *http.Request) {
+	// auth wrapper
+	auth := func(h http.HandlerFunc) http.HandlerFunc {
+		if s.controlToken == "" {
+			return h
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("X-Supervisor-Token") != s.controlToken {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			h(w, r)
+		}
+	}
+
+	mux.HandleFunc("/child/status", auth(func(w http.ResponseWriter, r *http.Request) {
+		type status struct {
+			Running           bool          `json:"running"`
+			PID               int           `json:"pid"`
+			UptimeSeconds     float64       `json:"uptimeSeconds"`
+			CrashCountWindow  int           `json:"crashCountWindow"`
+			CrashWindow       time.Duration `json:"crashWindow"`
+			EnableRestart     bool          `json:"enableRestart"`
+			LastRestartReason string        `json:"lastRestartReason"`
+			LastRestartAt     time.Time     `json:"lastRestartAt"`
+			BackoffSeconds    float64       `json:"backoffSeconds"`
+		}
+		pid := 0
+		running := false
+		if s.currentCmd != nil && s.currentCmd.Process != nil {
+			pid = s.currentCmd.Process.Pid
+			running = true
+		}
+		st := status{
+			Running:           running,
+			PID:               pid,
+			UptimeSeconds:     time.Since(s.startTime).Seconds(),
+			CrashCountWindow:  len(s.crashTimes),
+			CrashWindow:       s.crashWindow,
+			EnableRestart:     s.enableRestart,
+			LastRestartReason: s.lastRestartReason,
+			LastRestartAt:     s.lastRestartAt,
+			BackoffSeconds:    s.backoff.Seconds(),
+		}
+		_ = json.NewEncoder(w).Encode(st)
+	}))
+
+	mux.HandleFunc("/child/restart", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -763,8 +1023,9 @@ func (s *Supervisor) startMetricsServer() {
 		s.ManualRestart()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Child restart initiated"))
-	})
-	mux.HandleFunc("/child/shutdown", func(w http.ResponseWriter, r *http.Request) {
+	}))
+
+	mux.HandleFunc("/child/shutdown", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -772,8 +1033,9 @@ func (s *Supervisor) startMetricsServer() {
 		s.ManualShutdown()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Child shutdown initiated"))
-	})
-	mux.HandleFunc("/child/start", func(w http.ResponseWriter, r *http.Request) {
+	}))
+
+	mux.HandleFunc("/child/start", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -784,18 +1046,27 @@ func (s *Supervisor) startMetricsServer() {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Child started"))
-	})
-	slog.Info("Supervisor: metrics/health and control endpoints listening", slog.String("port", healthPort))
-	server := &http.Server{
-		Addr:    ":" + healthPort,
-		Handler: mux,
-	}
+	}))
+
+	mux.HandleFunc("/child/toggle-restart", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.enableRestart = !s.enableRestart
+		fmt.Fprintf(w, "enableRestart=%v", s.enableRestart)
+	}))
+
+	slog.Info("Supervisor: metrics/health and control endpoints listening", slog.String("port", s.healthPort))
+	server := &http.Server{Addr: ":" + s.healthPort, Handler: mux}
 	s.httpServer = server
+
 	go func() {
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("Supervisor: metrics server ListenAndServe error", slog.String("err", err.Error()))
 		}
 	}()
+
 	<-s.done
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -804,4 +1075,62 @@ func (s *Supervisor) startMetricsServer() {
 	} else {
 		slog.Info("Supervisor: metrics server shut down cleanly")
 	}
+}
+
+// ---------- Main loop / signals ----------
+
+func (s *Supervisor) mainLoop() {
+	sigC := make(chan os.Signal, 1)
+	signal.Notify(sigC, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	for {
+		select {
+		case sig := <-sigC:
+			switch sig {
+			case syscall.SIGHUP:
+				slog.Info("Supervisor: SIGHUP received, scheduling reload")
+				s.queueRestart("sighup")
+			default:
+				slog.Info("Supervisor: shutdown signal received, tearing down child and exiting")
+				close(s.done)
+				s.killChild()
+				return
+			}
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// ---------- Helpers ----------
+
+func dedupStrings(in []string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func ifThenElse[T any](cond bool, a, b T) T {
+	if cond {
+		return a
+	}
+	return b
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }
