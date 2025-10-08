@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -101,6 +102,11 @@ type Config struct {
 	CrashLoopThreshold     int           `yaml:"crashLoopThreshold" json:"crashLoopThreshold"`
 	CrashLoopWindow        time.Duration `yaml:"crashLoopWindow" json:"crashLoopWindow"`
 	ControlToken           string        `yaml:"controlToken" json:"controlToken"`
+	TLSCert                string        `yaml:"tlsCert" json:"tlsCert"`
+	TLSKey                 string        `yaml:"tlsKey" json:"tlsKey"`
+	HealthCheckURL         string        `yaml:"healthCheckURL" json:"healthCheckURL"`
+	HealthCheckInterval    time.Duration `yaml:"healthCheckInterval" json:"healthCheckInterval"`
+	LogLevel               string        `yaml:"logLevel" json:"logLevel"`
 }
 
 // loadConfig: supports YAML or JSON; returns empty config (not nil) if not found.
@@ -129,7 +135,47 @@ func loadConfig(configPath string) (*Config, error) {
 	if umErr != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", umErr)
 	}
+	if err := validateConfig(cfg); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	return cfg, nil
+}
+
+func validateConfig(cfg *Config) error {
+	if cfg.RestartBackoff < 0 {
+		return errors.New("restartBackoff must be non-negative")
+	}
+	if cfg.MaxBackoff < 0 {
+		return errors.New("maxBackoff must be non-negative")
+	}
+	if cfg.CrashLoopThreshold < 0 {
+		return errors.New("crashLoopThreshold must be non-negative")
+	}
+	if cfg.CrashLoopWindow < 0 {
+		return errors.New("crashLoopWindow must be non-negative")
+	}
+	if cfg.HealthCheckInterval < 0 {
+		return errors.New("healthCheckInterval must be non-negative")
+	}
+	if cfg.HealthCheckURL != "" {
+		if _, err := url.Parse(cfg.HealthCheckURL); err != nil {
+			return fmt.Errorf("invalid healthCheckURL: %w", err)
+		}
+	}
+	if cfg.TLSCert != "" && cfg.TLSKey == "" {
+		return errors.New("tlsKey required if tlsCert is provided")
+	}
+	if cfg.TLSKey != "" && cfg.TLSCert == "" {
+		return errors.New("tlsCert required if tlsKey is provided")
+	}
+	if cfg.LogLevel != "" {
+		switch cfg.LogLevel {
+		case "DEBUG", "INFO", "WARN", "ERROR":
+		default:
+			return errors.New("logLevel must be one of DEBUG, INFO, WARN, ERROR")
+		}
+	}
+	return nil
 }
 
 type Supervisor struct {
@@ -145,6 +191,7 @@ type Supervisor struct {
 	httpServer     *http.Server
 	callback       func(ctx context.Context) error
 	childCommand   string
+	configPath     string
 
 	// config-derived
 	envPaths     []string
@@ -170,6 +217,12 @@ type Supervisor struct {
 	controlToken           string
 	restartOnEnvHashChange bool
 
+	tlsCert             string
+	tlsKey              string
+	healthCheckURL      string
+	healthCheckInterval time.Duration
+	logLevel            string
+
 	// status
 	lastRestartReason string
 	lastRestartAt     time.Time
@@ -182,7 +235,7 @@ func Run(configPath string, callback func(ctx context.Context) error) {
 	if err != nil {
 		log.Fatalf("Failed to load config from %s: %v", configPath, err)
 	}
-	s := newSupervisor(cfg, callback, "")
+	s := newSupervisor(cfg, callback, "", configPath)
 	s.bootstrap()
 	s.mainLoop()
 }
@@ -201,7 +254,7 @@ func Execute() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-	s := newSupervisor(cfg, nil, *cmdFlag)
+	s := newSupervisor(cfg, nil, *cmdFlag, *configFlag)
 	// CLI flag overrides config
 	if enableRestartFlag != nil {
 		s.enableRestart = *enableRestartFlag
@@ -212,7 +265,7 @@ func Execute() {
 
 // ---------- Construction / defaults ----------
 
-func newSupervisor(cfg *Config, cb func(ctx context.Context) error, childCmd string) *Supervisor {
+func newSupervisor(cfg *Config, cb func(ctx context.Context) error, childCmd string, configPath string) *Supervisor {
 	// defaults
 	enableRestart := true
 	if cfg.EnableRestart != nil {
@@ -259,6 +312,7 @@ func newSupervisor(cfg *Config, cb func(ctx context.Context) error, childCmd str
 			"**/*.swp",
 			"**/*.tmp",
 			"**/*.log",
+			"**/*.db",
 			"**/node_modules/**",
 			"**/dist/**",
 			"**/build/**",
@@ -272,6 +326,7 @@ func newSupervisor(cfg *Config, cb func(ctx context.Context) error, childCmd str
 		startTime:              time.Now(),
 		callback:               cb,
 		childCommand:           childCmd,
+		configPath:             configPath,
 		envPaths:               dedupStrings(cfg.EnvPaths),
 		watchPaths:             dedupStrings(append(cfg.WatchPaths, cfg.EnvPaths...)),
 		includeGlobs:           dedupStrings(cfg.IncludeGlobs),
@@ -289,13 +344,18 @@ func newSupervisor(cfg *Config, cb func(ctx context.Context) error, childCmd str
 		enableRestart:          enableRestart,
 		controlToken:           firstNonEmpty(cfg.ControlToken, os.Getenv("SUPERVISOR_TOKEN")),
 		restartOnEnvHashChange: cfg.RestartOnEnvHashChange,
+		tlsCert:                cfg.TLSCert,
+		tlsKey:                 cfg.TLSKey,
+		healthCheckURL:         cfg.HealthCheckURL,
+		healthCheckInterval:    cfg.HealthCheckInterval,
+		logLevel:               cfg.LogLevel,
 	}
 }
 
 func (s *Supervisor) bootstrap() {
 	if os.Getenv("RUN_AS_CHILD") == "1" {
 		// Child mode: log to child log
-		setupLogging(s.childLog)
+		setupLogging(s.childLog, "INFO") // default for child
 		slog.Info("Child: starting callback")
 		ctx, cancel := context.WithCancel(context.Background())
 		sigC := make(chan os.Signal, 1)
@@ -316,7 +376,7 @@ func (s *Supervisor) bootstrap() {
 		return
 	}
 
-	setupLogging(s.supervisorLog)
+	setupLogging(s.supervisorLog, s.logLevel)
 	s.handlePIDFile() // robust handling for stale PID files
 
 	slog.Info("Supervisor: starting",
@@ -331,6 +391,9 @@ func (s *Supervisor) bootstrap() {
 	go s.watchLoop()
 
 	go s.envPoller()
+	if s.healthCheckURL != "" {
+		go s.healthChecker()
+	}
 	go s.metricsServer()
 
 	// choose spawn loop
@@ -343,7 +406,7 @@ func (s *Supervisor) bootstrap() {
 
 // ---------- Logging / PID ----------
 
-func setupLogging(logPath string) {
+func setupLogging(logPath string, logLevel string) {
 	dir := filepath.Dir(logPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "Could not create log dir '%s': %v\n", dir, err)
@@ -357,7 +420,20 @@ func setupLogging(logPath string) {
 		Compress:   true,
 	}
 	mw := io.MultiWriter(os.Stdout, fileLogger)
-	handler := slog.NewTextHandler(mw, &slog.HandlerOptions{AddSource: false})
+	level := &slog.LevelVar{}
+	switch logLevel {
+	case "DEBUG":
+		level.Set(slog.LevelDebug)
+	case "INFO":
+		level.Set(slog.LevelInfo)
+	case "WARN":
+		level.Set(slog.LevelWarn)
+	case "ERROR":
+		level.Set(slog.LevelError)
+	default:
+		level.Set(slog.LevelInfo)
+	}
+	handler := slog.NewTextHandler(mw, &slog.HandlerOptions{AddSource: false, Level: level})
 	slog.SetDefault(slog.New(handler))
 }
 
@@ -614,6 +690,14 @@ func (s *Supervisor) watchLoop() {
 				}
 			}
 
+			// If a directory is removed, remove it from watcher
+			if op&fsnotify.Remove != 0 {
+				if _, err := os.Stat(name); err != nil {
+					// File/dir no longer exists, try to remove from watcher
+					_ = s.watcher.Remove(name)
+				}
+			}
+
 			if op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
 				slog.Info("File event", slog.String("file", name), slog.String("op", op.String()))
 				select {
@@ -651,6 +735,32 @@ func (s *Supervisor) envPoller() {
 				if s.restartOnEnvHashChange {
 					s.queueRestart("env_file")
 				}
+			}
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// ---------- Health checker ----------
+
+func (s *Supervisor) healthChecker() {
+	interval := s.healthCheckInterval
+	if interval == 0 {
+		interval = 30 * time.Second // default
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	client := &http.Client{Timeout: 10 * time.Second}
+	for {
+		select {
+		case <-ticker.C:
+			resp, err := client.Get(s.healthCheckURL)
+			if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				slog.Warn("Health check failed", slog.String("url", s.healthCheckURL), slog.String("err", err.Error()))
+				s.queueRestart("health_check")
+			} else {
+				resp.Body.Close()
 			}
 		case <-s.done:
 			return
@@ -813,7 +923,8 @@ func (s *Supervisor) startChildStandalone() error {
 	if s.childCommand == "" {
 		return errors.New("no child command specified")
 	}
-	cmd := exec.Command("/bin/sh", "-c", s.childCommand)
+	shell, flag := s.getShellAndFlag()
+	cmd := exec.Command(shell, flag, s.childCommand)
 	cmd.Env = os.Environ()
 	if runtime.GOOS != "windows" {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -1057,13 +1168,41 @@ func (s *Supervisor) metricsServer() {
 		fmt.Fprintf(w, "enableRestart=%v", s.enableRestart)
 	}))
 
-	slog.Info("Supervisor: metrics/health and control endpoints listening", slog.String("port", s.healthPort))
+	mux.HandleFunc("/reload", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		cfg, err := loadConfig(s.configPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to reload config: %v", err), http.StatusInternalServerError)
+			return
+		}
+		// Update reloadable fields
+		s.envPaths = dedupStrings(cfg.EnvPaths)
+		s.watchPaths = dedupStrings(append(cfg.WatchPaths, cfg.EnvPaths...))
+		s.includeGlobs = dedupStrings(cfg.IncludeGlobs)
+		s.ignoreGlobs = dedupStrings(cfg.IgnoreGlobs)
+		s.restartOnEnvHashChange = cfg.RestartOnEnvHashChange
+		s.controlToken = firstNonEmpty(cfg.ControlToken, os.Getenv("SUPERVISOR_TOKEN"))
+		s.healthCheckURL = cfg.HealthCheckURL
+		s.healthCheckInterval = cfg.HealthCheckInterval
+		slog.Info("Config reloaded")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("Config reloaded"))
+	}))
 	server := &http.Server{Addr: ":" + s.healthPort, Handler: mux}
 	s.httpServer = server
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("Supervisor: metrics server ListenAndServe error", slog.String("err", err.Error()))
+		var err error
+		if s.tlsCert != "" && s.tlsKey != "" {
+			err = server.ListenAndServeTLS(s.tlsCert, s.tlsKey)
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Supervisor: metrics server error", slog.String("err", err.Error()))
 		}
 	}()
 
@@ -1133,4 +1272,11 @@ func firstNonEmpty(v ...string) string {
 		}
 	}
 	return ""
+}
+
+func (s *Supervisor) getShellAndFlag() (string, string) {
+	if runtime.GOOS == "windows" {
+		return "cmd", "/C"
+	}
+	return "/bin/sh", "-c"
 }
